@@ -1,6 +1,6 @@
-# BMI212-AURA
+# AURA (ADHD Understanding & Recognition Algorithm): Multimodal Machine Learning for Accurate ADHD Diagnosis Across Sexes.
 
-## AURA (ADHD Understanding & Recognition Algorithm): Multimodal Machine Learning for Accurate ADHD Diagnosis Across Sexes.
+## Abstract
 
 Attention-Deficit/Hyperactivity Disorder (ADHD) is severely underdiagnosed in women and young girls, with
 50-75% cases are estimated to be missed leading to delayed treatment, worsened mental health outcomes,
