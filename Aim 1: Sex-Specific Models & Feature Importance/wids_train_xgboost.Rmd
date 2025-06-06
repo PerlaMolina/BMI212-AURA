@@ -1,0 +1,856 @@
+---
+title: "bmi 212 wids"
+author: "Perla Molina"
+date: "2025-04-24"
+output: html_document
+---
+
+## Load necessary libraries for data manipulation, modeling, and visualization
+
+```{r}
+library(lubridate)
+library(pROC)
+library(PRROC)
+library(caret)
+library(pwr)
+library(xgboost)
+library(dplyr)
+
+library(ggplot2)
+library(gridExtra)
+library(reshape)
+library(broom)
+```
+
+## Read training datasets: categorical features, quantitative features, and outcomes
+
+```{r}
+train_categorical <- read.csv('training_data/TRAIN_CATEGORICAL_METADATA_new.csv')
+train_quant <- read.csv('training_data/TRAIN_QUANTITATIVE_METADATA_new.csv')
+training_y <- read.csv('training_data/TRAINING_SOLUTIONS.csv')
+```
+
+## Preview first few rows of categorical training data
+
+```{r}
+head(train_categorical)
+```
+
+## Check dimensions of categorical data
+
+```{r}
+dim(train_categorical)
+```
+
+## Preview first few rows of quantitative training data
+
+```{r}
+head(train_quant)
+```
+
+## Check dimensions of quantitative data
+
+```{r}
+dim(train_quant)
+```
+
+## Preview first few rows of outcome labels
+
+```{r}
+head(training_y)
+```
+
+## Check dimensions of outcome labels
+
+```{r}
+dim(training_y)
+```
+
+## Merge categorical, quantitative, and outcome data by participant ID
+
+```{r}
+# Merge on participant_id
+merged_data <- train_categorical %>%
+  inner_join(train_quant, by = "participant_id") %>%
+  inner_join(training_y, by = "participant_id")
+head(merged_data)
+```
+
+## Check dimensions of merged dataset
+
+```{r}
+dim(merged_data)
+```
+
+## Remove participant_id column since it is no longer needed for modeling
+
+```{r}
+# Drop participant_id column
+merged_data <- merged_data %>%
+  select(-participant_id)
+head(merged_data)
+```
+
+## Split data into male and female subsets based on Sex_F column
+
+```{r}
+# Split the data into male (Sex_F == 0) and female (Sex_F == 1)
+data_male <- merged_data %>% filter(Sex_F == 0)
+data_female <- merged_data %>% filter(Sex_F == 1)
+
+cat('males: ', dim(data_male))
+cat('\nfemales: ', dim(data_female))
+```
+
+## Remove Sex_F column from each subset as it is now redundant
+
+```{r}
+# Remove `participant_id` and `Sex_F` columns (not needed for training)
+data_male <- data_male %>%
+  select(-Sex_F)
+data_female <- data_female %>%
+  select(-Sex_F)
+
+cat('males: ', dim(data_male))
+cat('\nfemales: ', dim(data_female))
+```
+
+## Separate features (X) and outcome (y) for male and female datasets
+
+```{r}
+# Split into X and y for each sex
+y_male <- data_male$ADHD_Outcome
+X_male <- data_male %>% select(-ADHD_Outcome)
+
+y_female <- data_female$ADHD_Outcome
+X_female <- data_female %>% select(-ADHD_Outcome)
+```
+
+# TRAIN SEX-BASED MODELS
+
+## Function to train an XGBoost binary classification model with nested cross-validation and hyperparameter tuning
+
+```{r}
+# USE THIS ONE
+train_xgb_model <- function(X, y, label = "Sex") {
+  cat(sprintf("\n=== %s Model ===\n", label))
+  
+  set.seed(123)
+
+  X_matrix <- as.matrix(X)
+  y_vector <- as.numeric(y)
+  
+  train_indices <- sample(seq_len(nrow(X_matrix)), size = 0.7 * nrow(X_matrix)) # 70% of data
+  test_indices <- seq(nrow(X_matrix))[-train_indices] # remaining 30%
+  train <- train_indices
+  test <- test_indices
+  
+  train_data <- X_matrix[train, ]
+  train_labels <- y_vector[train]
+  test_data <- X_matrix[test, ]
+  test_labels <- y_vector[test]
+  
+  # set up outer folds
+  set.seed(1234)
+  outer_folds <- 5
+  folds <- sample(rep(1:outer_folds, length.out = nrow(train_data)))
+  outer_cv_results <- list()
+  
+  # hyperparameter grid search
+  param_grid <- expand.grid(
+    max_depth = c(4,6,8),
+    eta = c(0.01,0.1,0.3),
+    subsample = c(0.6,0.8,1),
+    colsample_bytree = c(0.6,0.8,1)
+  )
+  
+  for (outer_fold in 1:outer_folds) {
+    cat("\nOUTER FOLDER: ", outer_fold, " out of ", outer_folds, "\n")
+    
+    # split 70% into outer train/validation sets
+    outer_train_idx <- which(folds != outer_fold)
+    outer_val_idx <- which(folds == outer_fold)
+    
+    outer_train_data <- train_data[outer_train_idx, ]
+    outer_train_labels <- train_labels[outer_train_idx]
+    
+    outer_val_data <- train_data[outer_val_idx, ]
+    outer_val_labels <- train_labels[outer_val_idx]
+    
+    # inner cross-val for hyperparameter tuning
+    best_auc <- 0
+    best_params <- list()
+    best_nrounds <- 0
+    auc_scores <- list()
+    
+    cat("INNER CROSS VALIDATION...\n")
+    for (i in 1:nrow(param_grid)) {
+      cat("Percent ", (i/(nrow(param_grid)))*100, " done \n")
+      params <- list(
+        objective = "binary:logistic",
+        eval_metric = "auc",
+        max_depth = param_grid$max_depth[i],
+        eta = param_grid$eta[i],
+        subsample = param_grid$subsample[i],
+        colsample_bytree = param_grid$colsample_bytree[i]
+      )
+      
+      dtrain_inner <- xgb.DMatrix(data = outer_train_data, label = outer_train_labels)
+      
+      # inner cross-val on outer_train_data
+      inner_cv <- xgb.cv(
+        params = params,
+        data = dtrain_inner,
+        nrounds = 100,
+        nfold = 5,
+        early_stopping_rounds = 20,
+        verbose = 0
+      )
+      
+      # check if this set of parameters is the best
+      mean_auc <- max(inner_cv$evaluation_log$test_auc_mean)
+      best_nround <- inner_cv$best_iteration
+      
+      if (mean_auc > best_auc) {
+        best_auc <- mean_auc
+        best_params <- params
+        best_nrounds <- best_nround
+      }
+    }
+
+    # train model on outer training data with best parameters
+    dtrain_outer <- xgb.DMatrix(data = outer_train_data, label = outer_train_labels)
+    outer_model <- xgboost(
+      data = dtrain_outer,
+      params = best_params,
+      nrounds = best_nrounds,
+      verbose = 0
+    )
+    
+    # predict on outer validation data
+    dval_outer <- xgb.DMatrix(data = outer_val_data)
+    outer_predictions <- predict(outer_model, dval_outer)
+    
+    # store results for outer fold
+    outer_cv_results[[outer_fold]] <- list(
+      model = outer_model,
+      predictions = outer_predictions,
+      true_labels = outer_val_labels,
+      best_params = best_params,
+      best_nrounds = best_nrounds,
+      train = train,
+      test = test,
+      auc = best_auc
+    )
+    cat("Best AUC for outer folder ", outer_fold, ": ", best_auc, "\n")
+    auc_scores <- c(auc_scores, best_auc)
+  }
+  
+  # CONTINUE
+  cat(sprintf("Average AUC: %.4f\n", mean(as.numeric(auc_scores))))
+
+  return(outer_cv_results)
+}
+```
+
+## Train XGBoost models separately for male and female datasets
+
+train model
+```{r}
+# Run for male and female datasets
+train_male <- train_xgb_model(X_male, y_male, label = "Male")
+train_female <- train_xgb_model(X_female, y_female, label = "Female")
+```
+
+## Extract and display best hyperparameters for the male model
+
+train the final model and view results
+```{r}
+# for male model
+final_male_model_params <- train_male[[which.max(sapply(train_male, function(x) x$auc))]]$best_params
+final_male_nrounds <- train_male[[which.max(sapply(train_male, function(x) x$auc))]]$best_nrounds
+cat("\n\nBest Hyperparameters for Male Model:\n")
+cat("  max_depth: ", final_male_model_params$max_depth, "\n")
+cat("  eta: ", final_male_model_params$eta, "\n")
+cat("  subsample: ", final_male_model_params$subsample, "\n")
+cat("  colsample_bytree: ", final_male_model_params$colsample_bytree, "\n")
+cat("Best Number of Rounds: ", final_male_nrounds, "\n")
+
+# extract indicies
+train_male_idx <- train_male[[which.max(sapply(train_male, function(x) x$auc))]]$train
+train_male_X <- X_male[train_male_idx, ]
+train_male_y <- y_male[train_male_idx]
+
+test_male_idx <- train_male[[which.max(sapply(train_male, function(x) x$auc))]]$test
+test_male_X <- X_male[test_male_idx, ]
+test_male_y <- y_male[test_male_idx]
+
+dtrain_male_full <- xgb.DMatrix(data = as.matrix(train_male_X), label = train_male_y)
+male.model <- xgboost(
+  data = dtrain_male_full,
+  params = final_male_model_params,
+  nrounds = final_male_nrounds,
+  verbose = 0
+)
+
+# for female model
+final_female_model_params <- train_female[[which.max(sapply(train_female, function(x) x$auc))]]$best_params
+final_female_nrounds <- train_female[[which.max(sapply(train_female, function(x) x$auc))]]$best_nrounds
+cat("\n\nBest Hyperparameters for Female Model:\n")
+cat("  max_depth: ", final_female_model_params$max_depth, "\n")
+cat("  eta: ", final_female_model_params$eta, "\n")
+cat("  subsample: ", final_female_model_params$subsample, "\n")
+cat("  colsample_bytree: ", final_female_model_params$colsample_bytree, "\n")
+cat("Best Number of Rounds: ", final_female_nrounds, "\n")
+
+# extract indicies
+train_female_idx <- train_female[[which.max(sapply(train_female, function(x) x$auc))]]$train
+train_female_X <- X_female[train_female_idx, ]
+train_female_y <- y_female[train_female_idx]
+
+test_female_idx <- train_female[[which.max(sapply(train_female, function(x) x$auc))]]$test
+test_female_X <- X_female[test_female_idx, ]
+test_female_y <- y_female[test_female_idx]
+
+dtrain_female_full <- xgb.DMatrix(data = as.matrix(train_female_X), label = train_female_y)
+female.model <- xgboost(
+  data = dtrain_female_full,
+  params = final_female_model_params,
+  nrounds = final_female_nrounds,
+  verbose = 0
+)
+```
+
+# Visualizing results and extracting feature importance
+
+```{r}
+plot_calibration_curve <- function(predicted_probs, actual_labels, n_bins = 10, title = "Calibration Curve") {
+  df <- data.frame(prob = predicted_probs, actual = actual_labels)
+  df$bin <- cut(df$prob, breaks = seq(0, 1, length.out = n_bins + 1), include.lowest = TRUE)
+
+  calib_df <- df %>%
+    group_by(bin) %>%
+    summarise(
+      avg_pred_prob = mean(prob),
+      observed_prob = mean(actual),
+      count = n()
+    ) %>%
+    na.omit()
+
+  ggplot(calib_df, aes(x = avg_pred_prob, y = observed_prob)) +
+    geom_line(color = "blue") +
+    geom_point(size = 2) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+    xlim(0, 1) + ylim(0, 1) +
+    xlab("Mean Predicted Probability") +
+    ylab("Observed Frequency (Fraction of Positives)") +
+    ggtitle(title) +
+    theme_minimal()
+}
+```
+
+test male model
+```{r}
+male_predicted_probs <- predict(male.model, newdata = as.matrix(test_male_X))
+plot_calibration_curve(male_predicted_probs, test_male_y, title = "Calibration Curve - Male")
+```
+
+```{r}
+male.roc <- roc(test_male_y ~ male_predicted_probs, direction = "<")
+male.auroc <- male.roc$auc
+male.specificities <- male.roc$specificities
+male.sensitivities <- male.roc$sensitivities
+
+male.pr <- pr.curve(
+  scores.class0 = male_predicted_probs[test_male_y == 1],
+  scores.class1 = male_predicted_probs[test_male_y == 0],
+  curve = TRUE
+)
+male.pr.curve <- male.pr$curve
+male.auprc <- male.pr$auc.integral
+male.recall <- male.pr.curve[,1]
+male.precision <- male.pr.curve[,2]
+
+male.auprc.prev <- male.auprc / mean(y_male)
+male.pv <- wilcox.test(male_predicted_probs[test_male_y == 1],
+                       male_predicted_probs[test_male_y == 0])$p.value
+male.power <- pwr.t.test(
+  d = abs(male.auprc[length(male.auprc)] - 0.5),
+  n = length(test_male_y),
+  sig.level = 0.05,
+  type = 'one.sample',
+  alternative = 'greater'
+)$power
+```
+
+
+test female model
+```{r}
+female_predicted_probs <- predict(female.model, newdata = as.matrix(test_female_X))
+plot_calibration_curve(female_predicted_probs, test_female_y, title = "Calibration Curve - Female")
+```
+
+```{r}
+female.roc <- roc(test_female_y ~ female_predicted_probs, direction = "<")
+female.auroc <- female.roc$auc
+female.specificities <- female.roc$specificities
+female.sensitivities <- female.roc$sensitivities
+
+female.pr <- pr.curve(
+  scores.class0 = female_predicted_probs[test_female_y == 1],
+  scores.class1 = female_predicted_probs[test_female_y == 0],
+  curve = TRUE
+)
+female.pr.curve <- female.pr$curve
+female.auprc <- female.pr$auc.integral
+female.recall <- female.pr.curve[,1]
+female.precision <- female.pr.curve[,2]
+
+female.auprc.prev <- female.auprc / mean(y_female)
+female.pv <- wilcox.test(female_predicted_probs[test_female_y == 1],
+                       female_predicted_probs[test_female_y == 0])$p.value
+female.power <- pwr.t.test(
+  d = abs(female.auprc[length(female.auprc)] - 0.5),
+  n = length(test_female_y),
+  sig.level = 0.05,
+  type = 'one.sample',
+  alternative = 'greater'
+)$power
+```
+
+combined calibration curve plots
+```{r}
+plot_combined_calibration_curve <- function(male_probs, male_labels,
+                                            female_probs, female_labels,
+                                            n_bins = 10, title = "Calibration Curve") {
+  make_calib_df <- function(probs, labels, group) {
+    df <- data.frame(prob = probs, actual = labels)
+    df$bin <- cut(df$prob, breaks = seq(0, 1, length.out = n_bins + 1), include.lowest = TRUE)
+    df %>%
+      group_by(bin) %>%
+      summarise(
+        avg_pred_prob = mean(prob),
+        observed_prob = mean(actual),
+        .groups = "drop"
+      ) %>%
+      mutate(group = group)
+  }
+
+  male_df <- make_calib_df(male_probs, male_labels, "Male")
+  female_df <- make_calib_df(female_probs, female_labels, "Female")
+  calib_df <- rbind(male_df, female_df)
+
+  ggplot(calib_df, aes(x = avg_pred_prob, y = observed_prob, color = group)) +
+    geom_line() +
+    geom_point() +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+    xlim(0, 1) + ylim(0, 1) +
+    xlab("Mean Predicted Probability") +
+    ylab("Observed Frequency (Fraction of Positives)") +
+    ggtitle(title) +
+    scale_color_manual(values = c("Male" = "blue", "Female" = "red")) +
+    theme_minimal()
+}
+
+plot_combined_calibration_curve(
+  male_predicted_probs, test_male_y,
+  female_predicted_probs, test_female_y
+)
+```
+
+looking at roc and prc curves
+```{r}
+plot_combined_roc <- function(male_roc, female_roc, male_auroc, male_pv, female_auroc, female_pv, title = "ROC Curve") {
+  male_df <- data.frame(
+    FPR = 1 - male_roc$specificities,
+    TPR = male_roc$sensitivities,
+    group = "Male"
+  )
+  female_df <- data.frame(
+    FPR = 1 - female_roc$specificities,
+    TPR = female_roc$sensitivities,
+    group = "Female"
+  )
+  roc_df <- rbind(male_df, female_df)
+
+  ggplot(roc_df, aes(x = FPR, y = TPR, color = group)) +
+    geom_line(linewidth = 1.2) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+    annotate('label', label = paste(
+      "Male AUROC: ", round(male_auroc, 2),
+      '\nMale P-Value: ', male_pv,
+      '\nFemale AUROC: ', round(female_auroc, 2),
+      '\nFemale P-Value: ', female_pv),
+           x = 0.85, y = .2, size = 2.5) +
+    xlab("False Positive Rate") +
+    ylab("True Positive Rate") +
+    ggtitle(title) +
+    scale_color_manual(values = c("Male" = "blue", "Female" = "red")) +
+    theme_minimal()
+}
+
+plot_combined_roc(male.roc, female.roc, male.auroc, male.pv, female.auroc, female.pv)
+```
+
+```{r}
+plot_combined_prc <- function(male_recall, male_precision,
+                              female_recall, female_precision,
+                              male_auprc, male_auprc_gain,
+                              female_auprc, female_auprc_gain,
+                              title = "Precision-Recall Curve") {
+  male_df <- data.frame(
+    Recall = male_recall,
+    Precision = male_precision,
+    group = "Male"
+  )
+  female_df <- data.frame(
+    Recall = female_recall,
+    Precision = female_precision,
+    group = "Female"
+  )
+  pr_df <- rbind(male_df, female_df)
+
+  ggplot(pr_df, aes(x = Recall, y = Precision, color = group)) +
+    geom_line(size = 1.2) +
+    xlim(0,1) +
+    ylim(0,1) +
+    annotate('label', label = paste(
+      "Male AUPRC: ", round(male_auprc, 2),
+      '\nMale AUPRC/Prevelance: ', round(male_auprc_gain, 2),
+      '\nFemale AUPRC: ', round(female_auprc, 2),
+      '\nFemale AUPRC/Prevelance: ', round(female_auprc_gain, 2)),
+           x = 0.85, y = .2, size = 2.5) +
+    xlab("Recall") +
+    ylab("Precision") +
+    ggtitle(title) +
+    scale_color_manual(values = c("Male" = "blue", "Female" = "red")) +
+    theme_minimal()
+}
+
+plot_combined_prc(male.recall, male.precision, female.recall, female.precision, male.auprc, male.auprc.prev, female.auprc, female.auprc.prev)
+```
+
+==================================
+time to look at the top 5 features for each model
+====================================
+
+```{r}
+# looking at gain
+male.important <- xgb.importance(colnames(train_male_X), 
+                                         model = male.model)
+xgb.plot.importance(male.important[1:5,], col = "pink")
+```
+
+```{r}
+# looking at cover
+xgb.plot.importance(male.important[1:5,], col = "plum1", measure = 'Cover')
+```
+
+```{r}
+# looking at frequency
+xgb.plot.importance(male.important[1:5,], col = "red", measure = 'Frequency')
+```
+
+```{r}
+male.important$XGBoost_Feat_Importance_Ranking <- rownames(male.important)
+
+# Get any missing features
+missing_features <- setdiff(male.model$feature_names, male.important$Feature)
+new_rows <- data.frame(Feature = missing_features, matrix(NA, nrow = length(missing_features), ncol = ncol(male.important) - 1))
+
+colnames(new_rows) <- colnames(male.important)
+male.important <- rbind(male.important, new_rows)
+```
+
+```{r}
+# Compute means for cases and controls
+male_train_data <- data_male[train_male_idx, ]
+case_means <- colMeans(male_train_data[male_train_data$ADHD_Outcome == 1, colnames(train_male_X)], na.rm = TRUE)
+control_means <- colMeans(male_train_data[male_train_data$ADHD_Outcome == 0, colnames(train_male_X)], na.rm = TRUE)
+
+# Create a dataframe for comparison
+male_feature_comparison <- data.frame(
+  Feature = names(case_means),
+  Mean_Cases = case_means,
+  Mean_Controls = control_means
+)
+
+male.top.feats <- merge(male_feature_comparison, male.important, by='Feature')
+```
+
+Univariate testing 
+```{r}
+t_test_results <- sapply(male.top.feats$Feature, function(feature) {
+  t.test(train_male_X[train_male_y == 1, feature], train_male_X[train_male_y == 0, feature])$p.value
+})
+
+# Add to the results dataframe
+male.top.feats$Univariate_P_Value <- t_test_results
+
+# write csv
+write.csv(male.top.feats, 'male_top_feats_male_model.csv', row.names = FALSE)
+
+male.top.feats
+```
+
+Let's look at boxplots of the top 5 male feats
+
+```{r}
+male.top.feats$XGBoost_Feat_Importance_Ranking <- as.numeric(male.top.feats$XGBoost_Feat_Importance_Ranking)
+
+male.ranked.feats <- male.top.feats %>%
+  arrange(XGBoost_Feat_Importance_Ranking)
+
+male.topn.feats <- male.ranked.feats[1:10, ]
+
+#train_male_X_long <- log1p(train_male_X)
+
+features_to_plot <- train_male_X[, male.topn.feats$Feature]
+
+df_plot <- data.frame(y = factor(train_male_y, labels = c("Control", "Case")),
+                      features_to_plot)
+df_long <- melt(df_plot, id.vars = "y", variable = "Feature")
+
+# Create a named vector for p-values
+pval_labels <- male.topn.feats %>%
+  select(Feature, Univariate_P_Value) %>%
+  mutate(label = paste0(Feature, "\nP-val = ", signif(Univariate_P_Value, 3)))  # short format
+
+# Map features to label with p-values
+df_long$Feature <- factor(df_long$Feature,
+                          levels = pval_labels$Feature,
+                          labels = pval_labels$label)
+
+ggplot(df_long, aes(x = y, y = value, fill = y)) +
+  geom_boxplot(outlier.shape = NA) +  # remove dots if cluttered
+  facet_wrap(~ Feature, scales = "free", ncol = 4) +
+  labs(title = "Distribution of Top 10 Male Features by Class",
+       x = "Class", y = "Feature Value") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 10))
+```
+
+for female
+```{r}
+# looking at gain
+female.important <- xgb.importance(colnames(train_female_X), 
+                                         model = female.model)
+xgb.plot.importance(female.important[1:5,], col = "pink")
+```
+
+```{r}
+# looking at cover
+xgb.plot.importance(female.important[1:5,], col = "plum1", measure = 'Cover')
+```
+
+```{r}
+# looking at frequency
+xgb.plot.importance(female.important[1:5,], col = "red", measure = 'Frequency')
+```
+
+```{r}
+female.important$XGBoost_Feat_Importance_Ranking <- rownames(female.important)
+
+# Get any missing features
+missing_features <- setdiff(female.model$feature_names, female.important$Feature)
+new_rows <- data.frame(Feature = missing_features, matrix(NA, nrow = length(missing_features), ncol = ncol(female.important) - 1))
+
+colnames(new_rows) <- colnames(female.important)
+female.important <- rbind(female.important, new_rows)
+```
+
+```{r}
+# Compute means for cases and controls
+female_train_data <- data_female[train_female_idx, ]
+case_means <- colMeans(female_train_data[female_train_data$ADHD_Outcome == 1, colnames(train_female_X)], na.rm = TRUE)
+control_means <- colMeans(female_train_data[female_train_data$ADHD_Outcome == 0, colnames(train_female_X)], na.rm = TRUE)
+
+# Create a dataframe for comparison
+female_feature_comparison <- data.frame(
+  Feature = names(case_means),
+  Mean_Cases = case_means,
+  Mean_Controls = control_means
+)
+
+female.top.feats <- merge(female_feature_comparison, female.important, by='Feature')
+```
+
+Univariate testing 
+```{r}
+t_test_results <- sapply(female.top.feats$Feature, function(feature) {
+  t.test(train_female_X[train_female_y == 1, feature], train_female_X[train_female_y == 0, feature])$p.value
+})
+
+# Add to the results dataframe
+female.top.feats$Univariate_P_Value <- t_test_results
+
+# write csv
+write.csv(female.top.feats, 'female_top_feats_female_model.csv', row.names = FALSE)
+
+female.top.feats
+```
+
+Let's look at boxplots of the top 5 male feats
+
+```{r}
+female.top.feats$XGBoost_Feat_Importance_Ranking <- as.numeric(female.top.feats$XGBoost_Feat_Importance_Ranking)
+
+female.ranked.feats <- female.top.feats %>%
+  arrange(XGBoost_Feat_Importance_Ranking)
+
+female.topn.feats <- female.ranked.feats[1:10, ]
+
+#train_female_X_long <- log1p(train_female_X)
+
+features_to_plot <- train_female_X[, female.topn.feats$Feature]
+
+df_plot <- data.frame(y = factor(train_female_y, labels = c("Control", "Case")),
+                      features_to_plot)
+df_long <- melt(df_plot, id.vars = "y", variable = "Feature")
+
+# Create a named vector for p-values
+pval_labels <- female.topn.feats %>%
+  select(Feature, Univariate_P_Value) %>%
+  mutate(label = paste0(Feature, "\nP-val = ", signif(Univariate_P_Value, 3)))  # short format
+
+# Map features to label with p-values
+df_long$Feature <- factor(df_long$Feature,
+                          levels = pval_labels$Feature,
+                          labels = pval_labels$label)
+
+ggplot(df_long, aes(x = y, y = value, fill = y)) +
+  geom_boxplot(outlier.shape = NA) +  # remove dots if cluttered
+  facet_wrap(~ Feature, scales = "free", ncol = 4) +
+  labs(title = "Distribution of Top 10 Female Features by Class",
+       x = "Class", y = "Feature Value") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 10))
+```
+
+lets look at combined plots for each model
+```{r}
+# Top 10 features from each model
+male_top10sig <- male.top.feats %>%
+  filter(Univariate_P_Value < 0.05) %>%
+  arrange(XGBoost_Feat_Importance_Ranking) %>%
+  slice_head(n = 10)
+female_top10sig <- female.top.feats %>%
+  filter(Univariate_P_Value < 0.05) %>%
+  arrange(XGBoost_Feat_Importance_Ranking) %>%
+  slice_head(n = 10)
+
+male_top10 <- male_top10sig$Feature
+female_top10 <- female_top10sig$Feature
+
+# Union of features (ensures all are covered)
+top_features_union <- union(male_top10, female_top10)
+
+# Filter and tag by sex
+male_data <- male.important %>%
+  filter(Feature %in% top_features_union) %>%
+  mutate(Sex = "Male")
+
+female_data <- female.important %>%
+  filter(Feature %in% top_features_union) %>%
+  mutate(Sex = "Female")
+
+# Combine into one dataframe
+importance_combined <- bind_rows(male_data, female_data)
+```
+
+```{r}
+ggplot(importance_combined, aes(x = reorder(Feature, Gain), y = Gain, fill = Sex)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  coord_flip() +
+  labs(title = "Top Feature Gain: Male vs Female Model",
+       x = "Feature", y = "Gain") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Female" = "orchid", "Male" = "skyblue"))
+```
+
+```{r}
+ggplot(importance_combined, aes(x = reorder(Feature, Cover), y = Cover, fill = Sex)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  coord_flip() +
+  labs(title = "Top Feature Cover: Male vs Female Model",
+       x = "Feature", y = "Cover") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Female" = "orchid", "Male" = "skyblue"))
+```
+
+```{r}
+ggplot(importance_combined, aes(x = reorder(Feature, Frequency), y = Frequency, fill = Sex)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  coord_flip() +
+  labs(title = "Top Feature Frequency: Male vs Female Model",
+       x = "Feature", y = "Frequency") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Female" = "orchid", "Male" = "skyblue"))
+```
+
+```{r}
+# Ensure ranking is numeric
+importance_combined$XGBoost_Feat_Importance_Ranking <- as.numeric(importance_combined$XGBoost_Feat_Importance_Ranking)
+
+ggplot(importance_combined, aes(x = reorder(Feature, -XGBoost_Feat_Importance_Ranking), 
+                                y = XGBoost_Feat_Importance_Ranking, fill = Sex)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  scale_y_reverse(breaks = 1:20) +  # rank 1 is top
+  coord_flip() +
+  labs(title = "Top Feature Ranking: Male vs Female Model",
+       x = "Feature", y = "Ranking (Lower is More Important)") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Female" = "orchid", "Male" = "skyblue"))
+```
+
+look at top 5 feats indivudally by sex
+```{r}
+# Step 1: Select top 5 significant features by importance ranking
+male_top5_plot <- male.top.feats %>%
+  filter(Univariate_P_Value < 0.05) %>%
+  arrange(XGBoost_Feat_Importance_Ranking) %>%
+  slice_head(n = 5) %>%
+  select(Feature, Gain, Cover, Frequency)
+
+female_top5_plot <- female.top.feats %>%
+  filter(Univariate_P_Value < 0.05) %>%
+  arrange(XGBoost_Feat_Importance_Ranking) %>%
+  slice_head(n = 5) %>%
+  select(Feature, Gain, Cover, Frequency)
+
+# Step 2: Pivot longer for bar plot
+male_long <- male_top5_plot %>%
+  pivot_longer(cols = c(Gain, Cover, Frequency),
+               names_to = "Metric", values_to = "Value")
+
+female_long <- female_top5_plot %>%
+  pivot_longer(cols = c(Gain, Cover, Frequency),
+               names_to = "Metric", values_to = "Value")
+```
+
+```{r}
+# Step 3: Plot (Male)
+ggplot(male_long, aes(x = reorder(Feature, -Value), y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Top 5 Ranked Significant Features (Male)",
+       x = "Feature", y = "Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Step 4: Plot (Female)
+ggplot(female_long, aes(x = reorder(Feature, -Value), y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Top 5 Ranked Significant Features (Female)",
+       x = "Feature", y = "Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+
+
